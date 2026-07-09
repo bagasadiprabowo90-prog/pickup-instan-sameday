@@ -1,34 +1,60 @@
 import { useState, useEffect, useRef } from "react";
-import { Search, CheckCircle2, User, Phone, Package2, MapPin, Truck as TruckIcon, ArrowRight, X, CloudOff, RefreshCw, AlertTriangle } from "lucide-react";
+import { Search, CheckCircle2, User, Phone, Package2, MapPin, Truck as TruckIcon, ArrowRight, X, CloudOff, RefreshCw, AlertTriangle, Plus } from "lucide-react";
 import {
   useListPackages,
   getListPackagesQueryKey,
 } from "@/lib/hooks";
 import type { Package } from "@/lib/api";
-import { usePickupQueue, useQueueItem } from "@/lib/pickup-queue";
+import { usePickupQueue } from "@/lib/pickup-queue";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { motion, AnimatePresence } from "framer-motion";
-import { useForm } from "react-hook-form";
+import { useForm, useFieldArray } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Form, FormControl, FormField, FormItem, FormMessage, FormLabel } from "@/components/ui/form";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Label } from "@/components/ui/label";
 
 const driverFormSchema = z.object({
   nama_driver: z.string().min(2, "Nama driver harus diisi"),
-  no_hp: z.string().min(8, "No HP tidak valid").max(15, "No HP terlalu panjang")
+  no_hp: z.string().min(8, "No HP tidak valid").max(15, "No HP terlalu panjang"),
+  additional_codes: z.array(
+    z.object({
+      value: z.string()
+        .min(1, "Kode tidak boleh kosong")
+        .regex(/^[a-zA-Z0-9_-]+$/, "Format kode tidak valid")
+    })
+  ).default([])
 });
 
 export default function Driver() {
-  const { enqueue } = usePickupQueue();
+  const { enqueue, items: queueItems } = usePickupQueue();
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [selectedPackage, setSelectedPackage] = useState<Package | null>(null);
   const [success, setSuccess] = useState(false);
-  const [lastId, setLastId] = useState<string | null>(null);
-  const queueItem = useQueueItem(lastId);
+  const [lastIds, setLastIds] = useState<string[]>([]);
+  const [lastCodes, setLastCodes] = useState<string[]>([]);
+  
+  // Filter queue items that belong to the current submission
+  const activeQueueItems = queueItems.filter((it) => lastIds.includes(it.id));
+  
+  // Determine consolidated status
+  let syncStatus: "synced" | "syncing" | "error" = "synced";
+  let errorMessage = "";
+  
+  if (activeQueueItems.length > 0) {
+    const errorItem = activeQueueItems.find((it) => it.status === "error");
+    if (errorItem) {
+      syncStatus = "error";
+      errorMessage = errorItem.error || "Gagal sinkron";
+    } else {
+      syncStatus = "syncing";
+    }
+  }
+
   // Guards against a rapid double-tap enqueuing the same pickup twice before
   // the success screen replaces the form. Reset on handleReset.
   const submittedRef = useRef(false);
@@ -46,12 +72,20 @@ export default function Driver() {
     { query: { enabled: debouncedSearch.length >= 3, queryKey: getListPackagesQueryKey({ q: debouncedSearch }) } }
   );
 
+  const { data: allPackages } = useListPackages();
+
   const form = useForm<z.infer<typeof driverFormSchema>>({
     resolver: zodResolver(driverFormSchema),
     defaultValues: {
       nama_driver: "",
       no_hp: "",
+      additional_codes: [],
     },
+  });
+
+  const { fields, append, remove } = useFieldArray({
+    control: form.control,
+    name: "additional_codes",
   });
 
   // Local-first: save the pickup to the device immediately and let the
@@ -59,7 +93,19 @@ export default function Driver() {
   const onSubmit = (data: z.infer<typeof driverFormSchema>) => {
     if (!selectedPackage || submittedRef.current) return;
     submittedRef.current = true;
-    const id = enqueue({
+
+    const codes = [
+      selectedPackage.kode_pickup,
+      ...(data.additional_codes || [])
+        .map((c) => c.value.trim().toUpperCase())
+        .filter(Boolean),
+    ];
+    setLastCodes(codes);
+
+    const ids: string[] = [];
+
+    // Enqueue primary package
+    const primaryId = enqueue({
       kode_pickup: selectedPackage.kode_pickup,
       nama_driver: data.nama_driver,
       no_hp: data.no_hp,
@@ -67,7 +113,22 @@ export default function Driver() {
       alamat: selectedPackage.alamat,
       kurir: selectedPackage.kurir,
     });
-    setLastId(id);
+    ids.push(primaryId);
+
+    // Enqueue additional packages
+    (data.additional_codes || []).forEach((c) => {
+      const code = c.value.trim().toUpperCase();
+      if (code) {
+        const addId = enqueue({
+          kode_pickup: code,
+          nama_driver: data.nama_driver,
+          no_hp: data.no_hp,
+        });
+        ids.push(addId);
+      }
+    });
+
+    setLastIds(ids);
     setSuccess(true);
   };
 
@@ -76,7 +137,8 @@ export default function Driver() {
     setSelectedPackage(null);
     setSearchQuery("");
     setDebouncedSearch("");
-    setLastId(null);
+    setLastIds([]);
+    setLastCodes([]);
     submittedRef.current = false;
     form.reset();
   };
@@ -118,18 +180,29 @@ export default function Driver() {
                 <div className="space-y-2">
                   <h2 className="text-2xl font-bold text-green-900 dark:text-green-400">Pickup Berhasil!</h2>
                   <p className="text-green-700/80 dark:text-green-500/80 text-sm">
-                    Paket <span className="font-bold text-green-900 dark:text-green-400">{selectedPackage?.kode_pickup}</span> telah diserahkan.
+                    {lastCodes.length === 1 ? (
+                      <>
+                        Paket <span className="font-bold text-green-900 dark:text-green-400">{lastCodes[0]}</span> telah diserahkan.
+                      </>
+                    ) : (
+                      <>
+                        {lastCodes.length} paket telah diserahkan:{" "}
+                        <span className="font-bold text-green-900 dark:text-green-400">
+                          {lastCodes.join(", ")}
+                        </span>.
+                      </>
+                    )}
                   </p>
                 </div>
 
-                {queueItem?.status === "error" ? (
+                {syncStatus === "error" ? (
                   <div className="w-full flex items-start gap-2 rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900 p-3 text-left">
                     <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
                     <p className="text-xs text-amber-800 dark:text-amber-400">
-                      Tersimpan di perangkat, tapi gagal sinkron: {queueItem.error}
+                      Tersimpan di perangkat, tapi gagal sinkron: {errorMessage}
                     </p>
                   </div>
-                ) : queueItem && queueItem.status !== "synced" ? (
+                ) : syncStatus === "syncing" ? (
                   <div className="w-full flex items-center gap-2 rounded-xl bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-900 p-3 text-left">
                     {typeof navigator !== "undefined" && navigator.onLine === false ? (
                       <CloudOff className="w-4 h-4 text-blue-600 shrink-0" />
@@ -276,6 +349,105 @@ export default function Driver() {
               <Card className="p-5 shadow-md border-border bg-white dark:bg-card">
                 <Form {...form}>
                   <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-5">
+                    {/* Additional Pickup Codes Section */}
+                    <div className="space-y-3 pt-2">
+                      <div className="flex items-center justify-between">
+                        <Label className="text-sm font-semibold">Kode Pickup Tambahan (Opsional)</Label>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="text-xs font-semibold h-8 rounded-lg flex items-center gap-1 border-dashed hover:border-primary hover:text-primary"
+                          onClick={() => append({ value: "" })}
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                          Tambah Kode
+                        </Button>
+                      </div>
+                      
+                      <div className="space-y-3 max-h-64 overflow-y-auto pr-1">
+                        <AnimatePresence initial={false}>
+                          {fields.map((field, index) => (
+                            <motion.div
+                              key={field.id}
+                              initial={{ opacity: 0, height: 0 }}
+                              animate={{ opacity: 1, height: "auto" }}
+                              exit={{ opacity: 0, height: 0 }}
+                              transition={{ duration: 0.15 }}
+                              className="flex gap-2 items-start"
+                            >
+                              <FormField
+                                control={form.control}
+                                name={`additional_codes.${index}.value`}
+                                render={({ field: inputField }) => {
+                                  const pkgVal = inputField.value || "";
+                                  const matchedPkg = allPackages?.find(
+                                    (p) => p.kode_pickup.toUpperCase() === pkgVal.toUpperCase()
+                                  );
+
+                                  return (
+                                    <FormItem className="flex-1 space-y-1.5">
+                                      <FormControl>
+                                        <div className="relative">
+                                          <Package2 className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                                          <Input
+                                            {...inputField}
+                                            placeholder="Contoh: PKP12345"
+                                            className="pl-9 h-11 text-sm rounded-xl uppercase font-semibold bg-white dark:bg-card"
+                                            onChange={(e) => inputField.onChange(e.target.value.toUpperCase())}
+                                          />
+                                        </div>
+                                      </FormControl>
+                                      
+                                      {/* Package Details Display */}
+                                      {pkgVal.length >= 3 && (
+                                        <div className="p-3 rounded-xl bg-muted/40 border border-muted-foreground/10 text-xs space-y-1.5 animate-in fade-in duration-200 text-left">
+                                          {matchedPkg ? (
+                                            <>
+                                              <div className="flex items-center gap-1.5 font-medium text-foreground">
+                                                <User className="w-3.5 h-3.5 text-muted-foreground" />
+                                                <span>{matchedPkg.nama_penerima || "-"}</span>
+                                              </div>
+                                              <div className="flex items-start gap-1.5 text-muted-foreground">
+                                                <MapPin className="w-3.5 h-3.5 text-muted-foreground/70 shrink-0 mt-0.5" />
+                                                <span className="line-clamp-1">{matchedPkg.alamat || "-"}</span>
+                                              </div>
+                                              <div className="flex items-center gap-1.5">
+                                                <TruckIcon className="w-3.5 h-3.5 text-muted-foreground" />
+                                                <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-primary/10 text-primary">
+                                                  {matchedPkg.kurir || "-"}
+                                                </span>
+                                              </div>
+                                            </>
+                                          ) : (
+                                            <div className="text-amber-600 dark:text-amber-400 flex items-center gap-1.5 font-medium">
+                                              <AlertTriangle className="w-3.5 h-3.5" />
+                                              <span>Detail paket tidak ditemukan di data master</span>
+                                            </div>
+                                          )}
+                                        </div>
+                                      )}
+                                      
+                                      <FormMessage className="text-xs mt-1" />
+                                    </FormItem>
+                                  );
+                                }}
+                              />
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="h-11 w-11 rounded-xl text-muted-foreground hover:text-destructive hover:bg-destructive/10 shrink-0"
+                                onClick={() => remove(index)}
+                              >
+                                <X className="w-4 h-4" />
+                              </Button>
+                            </motion.div>
+                          ))}
+                        </AnimatePresence>
+                      </div>
+                    </div>
+
                     <FormField
                       control={form.control}
                       name="nama_driver"
